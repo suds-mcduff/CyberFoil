@@ -2177,6 +2177,158 @@ namespace remoteInstStuff {
         }
     }
 
+    // ---- RomM API mode ---------------------------------------------------
+    // With a RomM client API token ("rmm_...") the Switch library is listed from
+    // RomM's own authenticated REST API, so the (unauthenticated) Tinfoil feed is
+    // not needed. Falls back to the normal feed if the server is not RomM.
+    namespace {
+        std::string RommPercentEncode(const std::string& in)
+        {
+            static const char* hex = "0123456789ABCDEF";
+            std::string out;
+            for (unsigned char c : in) {
+                if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+                    out.push_back(static_cast<char>(c));
+                } else {
+                    out.push_back('%');
+                    out.push_back(hex[c >> 4]);
+                    out.push_back(hex[c & 0x0F]);
+                }
+            }
+            return out;
+        }
+
+        std::string RommJsonString(const nlohmann::json& j, const char* key)
+        {
+            auto it = j.find(key);
+            return (it != j.end() && it->is_string()) ? it->get<std::string>() : std::string();
+        }
+
+        std::uint64_t RommJsonUnsigned(const nlohmann::json& j, const char* key)
+        {
+            auto it = j.find(key);
+            return (it != j.end() && it->is_number_unsigned()) ? it->get<std::uint64_t>() : 0;
+        }
+
+        bool RommIsInstallableExtension(std::string ext)
+        {
+            std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (!ext.empty() && ext.front() == '.')
+                ext.erase(0, 1);
+            return ext == "nsp" || ext == "xci" || ext == "nsz" || ext == "xcz";
+        }
+
+        // Returns true and fills items on success. isRomm is set once the server
+        // identified itself as RomM, so the caller can report errors instead of
+        // silently falling back to the feed.
+        bool TryFetchRommItems(const std::string& baseUrl, const std::string& user, const std::string& pass,
+            std::vector<RemoteItem>& items, std::string& error, bool& isRomm,
+            const RemoteFetchProgressCallback& progressCb)
+        {
+            isRomm = false;
+            const std::string origin = GetUrlOrigin(baseUrl);
+            if (origin.empty())
+                return false;
+
+            // Only RomM answers /api/heartbeat with these blocks (public endpoint).
+            FetchResult hb = FetchRemoteResponse(origin + "/api/heartbeat", user, pass, progressCb);
+            if (hb.responseCode != 200 || hb.body.find("\"SYSTEM\"") == std::string::npos ||
+                hb.body.find("\"METADATA_SOURCES\"") == std::string::npos)
+                return false;
+            isRomm = true;
+
+            try {
+                FetchResult pf = FetchRemoteResponse(origin + "/api/platforms", user, pass, progressCb);
+                if (!ValidateRemoteResponse(pf, error))
+                    return false;
+                const nlohmann::json platforms = nlohmann::json::parse(pf.body);
+                std::uint64_t switchId = 0;
+                bool foundSwitch = false;
+                if (platforms.is_array()) {
+                    for (const auto& p : platforms) {
+                        if (p.is_object() && RommJsonString(p, "slug") == "switch") {
+                            switchId = RommJsonUnsigned(p, "id");
+                            foundSwitch = true;
+                            break;
+                        }
+                    }
+                }
+                if (!foundSwitch) {
+                    error = "RomM has no Nintendo Switch platform (slug \"switch\").";
+                    return false;
+                }
+
+                const std::size_t kPageSize = 100;
+                std::size_t offset = 0;
+                std::size_t skippedMultiFile = 0;
+                for (int page = 0; page < 200; page++) {
+                    const std::string url = origin + "/api/roms?platform_ids=" + std::to_string(switchId) +
+                        "&limit=" + std::to_string(kPageSize) + "&offset=" + std::to_string(offset);
+                    FetchResult rf = FetchRemoteResponse(url, user, pass, progressCb);
+                    if (!ValidateRemoteResponse(rf, error))
+                        return false;
+                    const nlohmann::json roms = nlohmann::json::parse(rf.body);
+                    auto itemsIt = roms.find("items");
+                    if (itemsIt == roms.end() || !itemsIt->is_array() || itemsIt->empty())
+                        break;
+
+                    for (const auto& r : *itemsIt) {
+                        if (!r.is_object())
+                            continue;
+                        const std::string fsName = RommJsonString(r, "fs_name");
+                        if (fsName.empty() || !RommIsInstallableExtension(RommJsonString(r, "fs_extension")))
+                            continue;
+                        auto multi = r.find("has_multiple_files");
+                        if (multi != r.end() && multi->is_boolean() && multi->get<bool>()) {
+                            skippedMultiFile++;
+                            continue;
+                        }
+                        const std::uint64_t romId = RommJsonUnsigned(r, "id");
+                        std::string baseName = RommJsonString(r, "fs_name_no_ext");
+                        if (baseName.empty())
+                            baseName = fsName;
+
+                        RemoteItem item;
+                        item.name = baseName;
+                        item.url = origin + "/api/roms/" + std::to_string(romId) + "/content/" + RommPercentEncode(fsName);
+                        item.indexSourceUrl = baseUrl;
+                        item.size = RommJsonUnsigned(r, "fs_size_bytes");
+                        ApplyLegacyMetadataFromName(baseName, item);
+
+                        const std::string cover = RommJsonString(r, "path_cover_small");
+                        if (!cover.empty()) {
+                            item.iconUrl = (cover.rfind("http", 0) == 0) ? cover : origin + (cover.front() == '/' ? "" : "/") + cover;
+                            item.hasIconUrl = true;
+                        }
+                        items.push_back(std::move(item));
+                    }
+
+                    offset += itemsIt->size();
+                    const std::uint64_t total = RommJsonUnsigned(roms, "total");
+                    if (total != 0 && offset >= total)
+                        break;
+                }
+
+                if (items.empty()) {
+                    error = "RomM has no single-file Switch games (.nsp, .xci, .nsz, .xcz).";
+                    if (skippedMultiFile > 0)
+                        error += " (" + std::to_string(skippedMultiFile) + " multi-file entries are not supported yet)";
+                    return false;
+                }
+                std::sort(items.begin(), items.end(), [](const RemoteItem& a, const RemoteItem& b) {
+                    return inst::util::ignoreCaseCompare(a.name, b.name);
+                });
+                error.clear();
+                return true;
+            }
+            catch (...) {
+                error = "Invalid RomM API response.";
+                items.clear();
+                return false;
+            }
+        }
+    }
+
     std::vector<RemoteItem> FetchRemote(const std::string& remoteUrl, const std::string& user, const std::string& pass, std::string& error, const RemoteFetchProgressCallback& progressCb)
     {
         std::vector<RemoteItem> items;
@@ -2186,6 +2338,14 @@ namespace remoteInstStuff {
         if (baseUrl.empty()) {
             error = "Remote URL is empty.";
             return items;
+        }
+
+        if (inst::util::IsBearerToken(pass)) {
+            bool isRomm = false;
+            if (TryFetchRommItems(baseUrl, user, pass, items, error, isRomm, progressCb))
+                return items;
+            if (isRomm)
+                return {};
         }
 
         FetchResult fetch = FetchRemoteResponse(baseUrl, user, pass, progressCb);
@@ -2223,6 +2383,19 @@ namespace remoteInstStuff {
         if (baseUrl.empty()) {
             error = "Remote URL is empty.";
             return sections;
+        }
+
+        if (inst::util::IsBearerToken(pass)) {
+            std::vector<RemoteItem> rommItems;
+            bool isRomm = false;
+            if (TryFetchRommItems(baseUrl, user, pass, rommItems, error, isRomm, progressCb)) {
+                if (outUsedLegacyFallback)
+                    *outUsedLegacyFallback = true;
+                sections.push_back({"all", "All", rommItems});
+                return sections;
+            }
+            if (isRomm)
+                return sections;
         }
 
         auto tryLegacyFallback = [&]() -> bool {
