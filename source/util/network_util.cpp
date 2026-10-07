@@ -32,6 +32,7 @@ SOFTWARE.
 #include <limits>
 #include "util/curl.hpp"
 #include "util/error.hpp"
+#include "util/auth.hpp"
 #include "util/hauth.hpp"
 #include "util/uid.hpp"
 #include "util/lang.hpp"
@@ -68,6 +69,7 @@ namespace tin::network
         std::transform(origin.begin(), origin.end(), origin.begin(), [](unsigned char c) {
             return static_cast<char>(std::tolower(c));
         });
+        inst::util::StripDefaultPort(origin);
         return origin;
     }
 
@@ -81,9 +83,8 @@ namespace tin::network
         if (!CanUseBasicAuthForUrl(url))
             return;
 
-        authValue = g_basic_auth_user + ":" + g_basic_auth_pass;
-        curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
-        curl_easy_setopt(curl, CURLOPT_USERPWD, authValue.c_str());
+        (void)authValue;
+        inst::util::ApplyCurlAuth(curl, g_basic_auth_user, g_basic_auth_pass, url);
     }
 
     static std::string TrimCopy(const std::string& in)
@@ -323,8 +324,8 @@ namespace tin::network
         const std::string hauthHeader = "HAUTH: " + inst::util::ComputeHauthFromUrl(requestUrl);
         const std::string uauthHeader = "UAUTH: " + inst::util::ComputeUauthFromUrl(
             requestUrl,
-            useBasicAuth ? g_basic_auth_user : "",
-            useBasicAuth ? g_basic_auth_pass : "");
+            useBasicAuth ? inst::util::LegacyAuthUser(g_basic_auth_user, g_basic_auth_pass) : "",
+            useBasicAuth ? inst::util::LegacyAuthPass(g_basic_auth_pass) : "");
         headerList = curl_slist_append(headerList, hauthHeader.c_str());
         headerList = curl_slist_append(headerList, uauthHeader.c_str());
         if (!legacyRequest) {

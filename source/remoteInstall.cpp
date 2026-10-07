@@ -29,6 +29,7 @@
 #include "util/config.hpp"
 #include "util/curl.hpp"
 #include "util/error.hpp"
+#include "util/auth.hpp"
 #include "util/hauth.hpp"
 #include "util/install_diagnostics.hpp"
 #include "util/json.hpp"
@@ -120,6 +121,7 @@ namespace {
         std::transform(origin.begin(), origin.end(), origin.begin(), [](unsigned char c) {
             return static_cast<char>(std::tolower(c));
         });
+        inst::util::StripDefaultPort(origin);
         return origin;
     }
 
@@ -271,7 +273,7 @@ namespace {
         std::string revisionHeader = "Revision: " + revisionValue;
         std::string languageHeader = "Language: " + Language::GetRemoteHeaderLanguage();
         std::string hauthHeader = "HAUTH: " + inst::util::ComputeHauthFromUrl(requestUrl);
-        std::string uauthHeader = "UAUTH: " + inst::util::ComputeUauthFromUrl(requestUrl, user, pass);
+        std::string uauthHeader = "UAUTH: " + inst::util::ComputeUauthFromUrl(requestUrl, inst::util::LegacyAuthUser(user, pass), inst::util::LegacyAuthPass(pass));
         std::string uidHeader = "UID: " + inst::util::ComputeUidFromMmcCid();
         return {
             themeHeader,
@@ -1508,12 +1510,7 @@ namespace remoteInstStuff {
             if (headerList)
                 curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headerList);
 
-            std::string authValue;
-            if (!user.empty() || !pass.empty()) {
-                authValue = user + ":" + pass;
-                curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
-                curl_easy_setopt(curl, CURLOPT_USERPWD, authValue.c_str());
-            }
+            inst::util::ApplyCurlAuth(curl, user, pass, url);
 
             const CURLcode rc = curl_easy_perform(curl);
             result.curlCode = rc;

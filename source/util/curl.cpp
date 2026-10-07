@@ -12,6 +12,7 @@
 #include "util/curl.hpp"
 #include "util/config.hpp"
 #include "util/error.hpp"
+#include "util/auth.hpp"
 #include "util/hauth.hpp"
 #include "util/lang.hpp"
 #include "util/uid.hpp"
@@ -122,7 +123,7 @@ static std::vector<std::string> buildRemoteHeaders(const std::string& requestUrl
     std::string revisionHeader = "Revision: " + revisionValue;
     std::string languageHeader = "Language: " + Language::GetRemoteHeaderLanguage();
     std::string hauthHeader = "HAUTH: " + inst::util::ComputeHauthFromUrl(requestUrl);
-    std::string uauthHeader = "UAUTH: " + inst::util::ComputeUauthFromUrl(requestUrl, user, pass);
+    std::string uauthHeader = "UAUTH: " + inst::util::ComputeUauthFromUrl(requestUrl, inst::util::LegacyAuthUser(user, pass), inst::util::LegacyAuthPass(pass));
     std::string uidHeader = "UID: " + inst::util::ComputeUidFromMmcCid();
     return {
         themeHeader,
@@ -506,11 +507,7 @@ namespace inst::curl {
         if (headerList)
             curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headerList);
 
-        if (!user.empty() || !pass.empty()) {
-            std::string authValue = user + ":" + pass;
-            curl_easy_setopt(curl_handle, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
-            curl_easy_setopt(curl_handle, CURLOPT_USERPWD, authValue.c_str());
-        }
+        inst::util::ApplyCurlAuth(curl_handle, user, pass, ourUrl);
 
         FILE *pagefile = fopen(pagefilename, "wb");
         if (pagefile == nullptr) {
@@ -575,11 +572,7 @@ namespace inst::curl {
         long responseCode = 0;
         char* contentType = nullptr;
 
-        if (!user.empty() || !pass.empty()) {
-            std::string authValue = user + ":" + pass;
-            curl_easy_setopt(curl_handle, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
-            curl_easy_setopt(curl_handle, CURLOPT_USERPWD, authValue.c_str());
-        }
+        inst::util::ApplyCurlAuth(curl_handle, user, pass, ourUrl);
 
         curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, pagefile);
         const CURLcode result = curl_easy_perform(curl_handle);
